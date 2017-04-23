@@ -1,0 +1,442 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using CommonLib;
+using System.Data.SqlClient;
+using System.Data;
+
+namespace SmartBeta
+{
+    class DBHelper
+    {
+        public static string gExcludeFileName = "mkt|Basic|Yield|Volatility";
+        public static string gConnStr = "";
+        public event SqlRowsCopiedEventHandler SqlRowsCopied;
+        public int gMAXTRANCOUNT;
+        private const int gMAXBULKSIZE = 20000;
+        private const int gTIMEOUT = 60;
+        //篩選設定檔
+        private const string gCalValueParamTable = "ValueCalParameter";
+        private const string gCalMomentumParamTable = "MomentumCalParameter";
+        //價值動能資料檔
+        private const string gCalValueCalFactorTable = "ValueCalFactor";
+        private const string gCalMomentumCalFactorTable = "MomentumCalFactor";
+        //報酬
+        private const string gCalValueBasicTable = "ValueBasicData";
+        private const string gCalMomentumBasicTable = "MomentumBasicData";
+        //殖利率
+        private const string gCalValueBasicYieTable = "ValueBasicYieData";
+        private const string gCalMomentumBasicYieTable = "MomentumBasicYieData";
+        //波動率
+        private const string gCalValueBasicVolTable = "ValueBasicVolData";
+        private const string gCalMomentumBasicVolTable = "MomentumBasicVolData";
+        //Beta
+        private const string gCalValueBasicBtaTable = "ValueBasicBtaData";
+        private const string gCalMomentumBasicBtaTable = "MomentumBasicBtaData";
+
+        public DBHelper(int pTranCount)
+        {
+            gMAXTRANCOUNT = pTranCount;
+        }
+
+        /// 自訂失敗的EventArgs
+        /// <summary>
+        /// 自訂失敗的EventArgs
+        /// </summary>
+        public class DBHelperEventArgs : EventArgs
+        {
+            public string Messsage { get; set; }
+        }
+
+        /// 將資料寫入資料庫中
+        /// <summary>
+        /// 將資料寫入資料庫中
+        /// </summary>
+        /// <param name="pDT">轉入資料</param>
+        /// <param name="pDataType">Basic or mscore...</param>
+        /// <param name="pCalType">0:Value,1:動能</param>
+        /// <returns></returns>
+        internal bool ReadFileToDB(DataTable pDT, string pDataType, int pCalType)
+        {
+            if (gExcludeFileName.IndexOf(pDataType) != -1)
+            {
+                return TranFileToBasicData(pDT, pDataType, pCalType);
+            }
+            else
+            {
+                return TranFileToOther(pDT, pDataType, pCalType);
+            }
+        }
+
+        /// 轉入Basic相關資料
+        /// <summary>
+        /// 轉入Basic相關資料
+        /// </summary>
+        /// <param name="pDT">轉入資料</param>
+        /// <param name="pDataType">0:Value,1:動能</param>
+        internal bool TranFileToBasicData(DataTable pDT, string pDataType, int pCalType)
+        {
+            int vErrCount = 0;
+
+            using (SqlConnection vSqlConn = new SqlConnection(gConnStr))
+            {
+                try
+                {
+                    vSqlConn.Open();
+                    using (SqlBulkCopy sqlBC = new SqlBulkCopy(vSqlConn))
+                    {
+                        sqlBC.BatchSize = gMAXBULKSIZE;
+                        sqlBC.BulkCopyTimeout = gTIMEOUT;
+                        sqlBC.NotifyAfter = gMAXTRANCOUNT;
+                        sqlBC.SqlRowsCopied += new SqlRowsCopiedEventHandler(OnNotifyWriteCount);
+                        sqlBC.DestinationTableName = GetBasicTableStr(pDataType, pCalType);
+                        sqlBC.ColumnMappings.Add("stock", "STK_CD");
+                        sqlBC.ColumnMappings.Add("data_date", "DATA_DATE");
+                        sqlBC.ColumnMappings.Add("mkt_value", "VALUE");
+                        sqlBC.WriteToServer(pDT);
+                        //如果是回報率就要算Bate                        
+                    }                   
+                }
+                catch (Exception ex)
+                {
+                    vErrCount += gMAXBULKSIZE;
+                }
+                finally
+                {
+                    if (pDataType.Equals("Basic"))
+                    {                        
+                        DBKit.GetData(string.Format("EXEC sp_GenBetaData {0}", (pCalType%2)), gConnStr );
+                    }
+                }
+            }
+            return (vErrCount == 0) ? true : false;
+        }
+
+
+
+        /// 轉入系統因子相關資料
+        /// <summary>
+        /// 轉入系統因子相關資料
+        /// </summary>
+        /// <param name="pDT">轉入資料</param>
+        /// <param name="pCalType">0:Value,1:動能</param>
+        internal bool TranFileToOther(DataTable pDT, string pDataType, int pCalType)
+        {
+            int vErrCount = 0;
+            using (SqlConnection vSqlConn = new SqlConnection(gConnStr))
+            {
+                try
+                {
+                    vSqlConn.Open();
+                    using (SqlBulkCopy sqlBC = new SqlBulkCopy(vSqlConn))
+                    {
+                        sqlBC.BatchSize = gMAXBULKSIZE;
+                        sqlBC.BulkCopyTimeout = gTIMEOUT;
+                        //不用通知資料量相對小很多
+                        sqlBC.NotifyAfter = gMAXTRANCOUNT;
+                        sqlBC.SqlRowsCopied += new SqlRowsCopiedEventHandler(OnNotifyWriteCount);
+                        sqlBC.DestinationTableName = GetOtherTableStr(pCalType);
+                        sqlBC.ColumnMappings.Add("stock", "STK_CD");
+                        sqlBC.ColumnMappings.Add("data_date", "DATA_DATE");
+                        sqlBC.ColumnMappings.Add("type", "TYPE");
+                        sqlBC.ColumnMappings.Add("value", "VALUE");
+                        sqlBC.WriteToServer(pDT);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    vErrCount += gMAXBULKSIZE;
+                }
+            }
+            return (vErrCount == 0) ? true : false;
+        }
+
+        /// 檢驗資料是否已經存在
+        /// <summary>
+        /// 檢驗資料是否已經存在
+        /// </summary>
+        /// <param name="pDataType">Basic or mscore...</param>
+        /// <param name="pCalType">0:Value,1:動能</param>
+        internal bool ChkData(string pDataType, int pCalType)
+        {
+            bool vResult = false;
+            string vTableStr;
+            string vSqlCmd;
+
+
+            if (gExcludeFileName.IndexOf(pDataType) != -1)
+            {
+                vTableStr = GetBasicTableStr(pDataType, pCalType);
+                vSqlCmd = string.Format("SELECT TOP 1 COUNT(1) [ROW_NUMBERS] FROM {0}", vTableStr);
+            }
+            else
+            {
+                vTableStr = GetOtherTableStr(pCalType);
+                vSqlCmd = string.Format("SELECT TOP 1 COUNT(1) [ROW_NUMBERS] FROM {0} WHERE TYPE='{1}'", vTableStr, pDataType);
+            }
+
+
+            DataTable vDT = DBKit.GetData(vSqlCmd, gConnStr);
+            if (vDT != null && vDT.Rows.Count > 0)
+            {
+                string ROW_NUMBERS = vDT.Rows[0]["ROW_NUMBERS"].ToString();
+                vResult = ToolKit.GetInt32(ROW_NUMBERS) > 0 ? true : false;
+            }
+            return vResult;
+        }
+
+        /// 取得Basic的Table String
+        /// <summary>
+        /// 取得Basic的Table String
+        /// </summary>
+        /// <param name="pCalType">0:Value,1:動能</param>
+        /// <returns></returns>
+        internal string GetBasicTableStr(string pDataType, int pCalType)
+        {
+            string vDataBaseStr;
+
+            switch (pDataType)
+            {
+                case "Basic":
+                    vDataBaseStr = pCalType == 0 ? gCalValueBasicTable : gCalMomentumBasicTable;
+                    break;
+                case "Yield":
+                    vDataBaseStr = pCalType == 0 ? gCalValueBasicYieTable : gCalMomentumBasicYieTable;
+                    break;
+                case "Volatility":
+                    vDataBaseStr = pCalType == 0 ? gCalValueBasicVolTable : gCalMomentumBasicVolTable;
+                    break;
+                default:
+                    vDataBaseStr = "";
+                    break;
+            }
+
+            return vDataBaseStr;
+        }
+
+        /// 取得其他因子的Table String
+        /// <summary>
+        /// 取得其他因子的Table String
+        /// </summary>
+        /// <param name="pCalType">0:Value,1:動能</param>
+        /// <returns></returns>
+        internal string GetOtherTableStr(int pCalType)
+        {
+            string vDataBaseStr;
+            if (pCalType == 0)
+            {
+                vDataBaseStr = gCalValueCalFactorTable;
+            }
+            else
+            {
+                vDataBaseStr = gCalMomentumCalFactorTable;
+            }
+            return vDataBaseStr;
+        }
+
+
+        /// 刪除資料
+        /// <summary>
+        /// 刪除資料
+        /// </summary>
+        /// <param name="pDataType">Basic or Factor</param>
+        /// <param name="pCalType">0:Value,1:動能</param>
+        /// <returns></returns>
+        internal bool DelData(string pDataType, int pCalType)
+        {
+            bool vResult = false;
+            string vDataBaseStr;
+            string vSqlCmd;
+
+            if (gExcludeFileName.IndexOf(pDataType) != -1)
+            {
+                vDataBaseStr = GetBasicTableStr(pDataType, pCalType);
+                DBKit.TruncateTable(true, gConnStr, vDataBaseStr);
+            }
+            else
+            {
+                vDataBaseStr = GetOtherTableStr(pCalType);
+                vSqlCmd = string.Format("DELETE FROM {0} WHERE [TYPE]='{1}'", vDataBaseStr, pDataType);
+                DBKit.DeleteData(gConnStr, new SqlCommand(vSqlCmd));
+            }
+
+            vSqlCmd = string.Format("SELECT COUNT(1) [ROW_NUMBERS] FROM dbo.{0}", vDataBaseStr);
+            DataTable vDT = DBKit.GetData(vSqlCmd, gConnStr);
+            if (vDT != null && vDT.Rows.Count > 0)
+            {
+                string vNum_Rows = vDT.Rows[0]["ROW_NUMBERS"].ToString();
+                if (vNum_Rows == "0")
+                {
+                    vResult = true;
+                }
+            }
+            return vResult;
+        }
+
+        /// 轉入系統因子的參數資料
+        /// <summary>
+        /// 轉入系統因子的參數資料
+        /// SqlBulkCopy可以把DataTable的資料一次大量的寫入SQL SERVER資料庫,不過只能寫入的目的地端只能是SQL SERVER
+        /// SqlBulkCopy裡面就只能放SqlConnection，不能放別的像是OleDbConnection
+        /// </summary>
+        /// <param name="pCalType">0:Value,1:動能</param>
+        /// <param name="pDT">轉入因子的參數資料</param>
+        internal static void InsCalParam(int pCalType, DataTable pDT)
+        {
+            string vCalStr = "";
+            if (pCalType == 0)
+            {
+                DBKit.TruncateTable(true, gConnStr, "ValueCalParameter");
+                vCalStr = "V";
+            }
+            else
+            {
+                DBKit.TruncateTable(true, gConnStr, "MomentumCalParameter");
+                vCalStr = "M";
+            }
+
+            using (var bulkCopy = new SqlBulkCopy(gConnStr, SqlBulkCopyOptions.KeepIdentity))
+            {
+                //設定你要複製過去的DataTable的每個欄位要對應到目的地的哪個欄位
+                bulkCopy.ColumnMappings.Add(vCalStr + "Factor", "TYPE");
+                bulkCopy.ColumnMappings.Add(vCalStr + "Operator", "OPERATOR");
+                bulkCopy.ColumnMappings.Add(vCalStr + "Unit", "UNIT");
+                bulkCopy.ColumnMappings.Add(vCalStr + "OrderBy", "ORDERBY");
+                bulkCopy.ColumnMappings.Add(vCalStr + "PickUp", "PICKUP");
+                bulkCopy.ColumnMappings.Add(vCalStr + "Filter", "FILTER");
+
+                bulkCopy.BulkCopyTimeout = gTIMEOUT;
+                if (pCalType == 0)
+                {
+                    //複製到目的地的哪個資料表
+                    bulkCopy.DestinationTableName = gCalValueParamTable;
+                }
+                else
+                {
+                    bulkCopy.DestinationTableName = gCalMomentumParamTable;
+                }
+                //假設pDT是已經有資料的DataTable，直接放進去就可以開始寫入了
+                bulkCopy.WriteToServer(pDT);
+            }
+        }
+
+        /// SQL BULK COPY的轉入通知筆數
+        /// <summary>
+        /// SQL BULK COPY的轉入通知筆數
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        protected void OnNotifyWriteCount(object sender, SqlRowsCopiedEventArgs e)
+        {
+            SqlRowsCopiedEventHandler handler = SqlRowsCopied;
+            if (handler != null)
+                handler.BeginInvoke(sender, e, null, null);
+        }
+
+        /// 確認設定的系統因子參數資料皆已轉入
+        /// <summary>
+        /// 確認設定的系統因子參數資料皆已轉入
+        /// </summary>
+        /// <param name="pCalType">0:Value,1:動能</param>
+        /// <param name="pCalParam">系統因子設定名稱,如:mscroe..fscore</param>
+        /// <returns></returns>
+        internal static bool ChkAllValueData(int pCalType, string pCalParam)
+        {
+            string vSqlCommStr = string.Format("SELECT ISNULL(dbo.fn_CheckParam({0},'{1}'),'FALSE')", pCalType, pCalParam);
+            DataTable vDT = DBKit.GetData(gConnStr, new SqlCommand(vSqlCommStr));
+            bool vResult = false;
+            if (vDT == null || vDT.Rows.Count == 0)
+            {
+                vResult = false;
+            }
+            else
+            {
+                bool.TryParse(vDT.Rows[0][0].ToString(), out vResult);
+            }
+            return vResult;
+        }
+
+        //市值加權{0,1}
+        internal static DataSet GetCalResult(string vTakeNumber, string vStartMonth, int pCalType)
+        {
+            DataSet vResult;
+            string vSQLCmd = string.Format("EXEC sp_GetCalResult {0},{1},{2}", vTakeNumber, vStartMonth, pCalType);
+            vResult = DBKit.GetDataToDataSet(vSQLCmd, gConnStr);
+            return vResult;
+        }
+
+        //基本面加權{2,3}
+        internal static int[] GetCalResult(string vTakeNumber, string vStartMonth,string vFac,string vVol,string vCap,string vCost, int pCalType)
+        {
+            //波動幅度計算
+            string[] sArray = vFac.Split(',');
+            int iCount = sArray.Length;            
+            int vTop = (100 / iCount) + (int.Parse(vVol) * (100/iCount))/100;
+            int vDown = (100 / iCount) - (int.Parse(vVol) * (100 / iCount))/100;
+            int[] intVOL = { vTop, vDown };
+            ////尋找有效的排列組合值
+            List<int[]> lstInt = getPermutations(iCount, vDown, vTop);
+
+            return intVOL;
+            /*
+            DataSet vResult;
+            string vSQLCmd = string.Format("EXEC sp_GetBasicCalResult {0},{1},{2},{3},{4},{5},{6}", vTakeNumber, vStartMonth,vFac,vVol,vCap,vCost, pCalType);
+            vResult = DBKit.GetDataToDataSet(vSQLCmd, gConnStr);
+            return vResult;
+            */
+        }
+
+        /// <summary>
+        /// 尋找有效的排列組合值       
+        /// </summary>
+        /// <param name="p">count 取幾位</param>
+        /// <param name="t1">from 陣列的起始值</param>
+        /// <param name="t2">to   陣列的終止值</param>
+        /// <returns></returns>
+        private static List<int[]> getPermutations(int p, int t1, int t2)
+        {
+            List<int[]> listArray = new List<int[]>();
+            string str = System.Environment.CurrentDirectory;
+            using (System.IO.StreamWriter file =
+            new System.IO.StreamWriter(str +"\\WriteLines1.txt") )
+            {
+                foreach (var sequence in M(p, t1, t2))
+                {
+                    string[] sResult = string.Join(",", sequence).Split(',');
+                    int[] iResult = sResult.Select(x => int.Parse(x)).ToArray();
+                    if (iResult.Sum() == 100)
+                    {
+                        listArray.Add(iResult);
+                        file.WriteLine(string.Join(",", iResult));
+                    }
+                }
+            }
+            return listArray;
+        }
+
+        /// <summary>
+        /// 排列組合(可以重複)
+        /// </summary>
+        /// <param name="p">count 取幾位</param>
+        /// <param name="t1">from 陣列的起始值</param>
+        /// <param name="t2">to   陣列的終止值</param>
+        /// <returns></returns>        
+        private static IEnumerable<IEnumerable<int>> M(int p, int t1, int t2)
+        {
+            if (p == 0)
+                yield return Enumerable.Empty<int>();
+            else
+                for (int first = t1; first <= t2; ++first)
+                    foreach (var rest in M(p - 1, first, t2))
+                        yield return Prepend(first, rest);
+        }
+        private static IEnumerable<T> Prepend<T>(T first, IEnumerable<T> rest)
+        {
+            yield return first;
+            foreach (var item in rest)
+                yield return item;
+        }
+    }
+}

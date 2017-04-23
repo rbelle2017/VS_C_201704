@@ -1,0 +1,908 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using System.IO;
+using System.Threading;
+using CommonLib;
+using Excel = Microsoft.Office.Interop.Excel;
+
+namespace SmartBeta
+{
+    public partial class SmartBetaForm : Form
+    {
+        private static string gExcludeFileName = DBHelper.gExcludeFileName;
+        private delegate void TextShowCallback(object sender, string text);
+        private delegate void EnabledObjectDelegate(object sender);
+        private const int gMAXLEN = 15;
+        private const int gMAXTRANCOUNT = 1000000;
+        private static decimal gTotalCount = 0;
+        private static decimal gDealCount = 0;
+        private static string gGenFilePath = "";
+
+
+
+        private object gLockObj = new object();
+        public SmartBetaForm()
+        {
+            InitializeComponent();
+            DBHelper.gConnStr = ToolKit.GetConnectionValue("SBConn", "");
+            XMLKit.SettingDataFromXML(ToolKit.GetCurrentFileFullPath("\\ValuePositiveFactor.xml"), ref dgvValuePositiveFactor);
+            XMLKit.SettingDataFromXML(ToolKit.GetCurrentFileFullPath("\\MomentumPositiveFactor.xml"), ref dgvMomentumPositiveFator);
+            List<string> StartMonthMember = new List<string>();
+            StartMonthMember.Add("12");
+            StartMonthMember.Add("1");
+            StartMonthMember.Add("2");
+            gGenFilePath = ToolKit.GetConfigValue("GenFileFilePath", "");
+            this.cbBoxStartMonth.DataSource = StartMonthMember;
+            this.cbBoxStartMonth.SelectedIndex = StartMonthMember.Count - 1;
+
+        }
+
+        /// 上傳價值的資料
+        /// <summary>
+        /// 上傳價值的資料
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void btnValueUpdData_Click(object sender, EventArgs e)
+        {
+            int TranType = CalTab.SelectedIndex;//0:Value,1:動能
+            if (openFileDialog1.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+            {
+                txtValueFilePath.Text = openFileDialog1.FileName;
+            }
+            else
+            {
+                return;
+            }
+
+            string vFilePath = txtValueFilePath.Text;
+            //確認檔案是否存在且屬於csv的檔案
+            if (string.IsNullOrEmpty(vFilePath))
+            {
+                return;
+            }
+            TranFilePreOperation(vFilePath, "VFactor", dgvValuePositiveFactor, 0);
+        }
+
+        /// 上傳動能的資料
+        /// <summary>
+        /// 上傳動能的資料
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void btnMomentumUploadData_Click(object sender, EventArgs e)
+        {
+            if (openFileDialog1.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+            {
+                txtMomentumFilePath.Text = openFileDialog1.FileName;
+            }
+            else
+            {
+                return;
+            }
+            string vFilePath = txtMomentumFilePath.Text;
+            //確認檔案是否存在且屬於csv的檔案
+            if (string.IsNullOrEmpty(vFilePath))
+            {
+                return;
+            }
+            TranFilePreOperation(vFilePath, "MFactor", dgvMomentumPositiveFator, 1);
+        }
+
+        /// 上傳的前置作業
+        /// <summary>
+        /// 上傳的前置作業
+        /// </summary>
+        /// <param name="pFilePath">實體路徑</param>
+        /// <param name="pPositiveFactorStr">DataGridView的第一欄, 因為上傳檔案名稱以第一欄命名</param>
+        /// <param name="pDGV">DataGridView對應的物件</param>
+        /// <param name="pCalType">上傳類型[0=價值|1=動能]</param>
+        /// <returns></returns>
+        private void TranFilePreOperation(string pFilePath, string pPositiveFactorStr, DataGridView pDGV, int pCalType)
+        {
+            FileInfo vFileInfo = new FileInfo(pFilePath);
+            if (vFileInfo.Exists && vFileInfo.Extension == ".csv")
+            {
+                string vFileName = Path.GetFileNameWithoutExtension(vFileInfo.Name);
+                if (gExcludeFileName.IndexOf(vFileName) == -1)
+                {
+                    DataTable vDT = ToolKit.CreateDataTableFormDataGridView(pDGV);
+                    var vObj = (from o in vDT.AsEnumerable()
+                                where o.Field<string>(pPositiveFactorStr) == vFileName
+                                select o.Field<string>(pPositiveFactorStr) == vFileName).FirstOrDefault();
+                    //如果檔案名稱和設定的因子名稱不符就不上傳
+                    if (((bool)vObj) == false)
+                    {
+                        MessageBox.Show("請確定上傳的檔案,已經設定於排定的系統因子中");
+                        return;
+                    }
+                }
+
+                if (gExcludeFileName.ToLower().IndexOf(vFileName.ToLower()) != -1)
+                {
+                    string[] strArray = gExcludeFileName.Split('|');
+                    int iIdx = Array.FindIndex(strArray, s => s.ToLower().Equals(vFileName.ToLower()));
+                    Thread vMKTThread = new Thread(() => TranBasicFile(pFilePath, strArray[iIdx == 0 ? 1 : iIdx], pCalType));
+                    vMKTThread.IsBackground = true;
+                    vMKTThread.Start();
+                    TextShow(logRichTextBox, string.Format("開始轉入{0} Data..", vFileName));
+                    this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), false);
+                }
+                else
+                {
+                    Thread vOtherThread = new Thread(() => TranFile(pFilePath, vFileName, pCalType));
+                    vOtherThread.IsBackground = true;
+                    vOtherThread.Start();
+                    TextShow(logRichTextBox, string.Format("開始轉入{0}..", vFileName));
+                    this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), false);
+                }
+
+            }
+        }
+
+        /// 轉入系統因子資料
+        /// <summary>
+        /// 轉入系統因子資料
+        /// </summary>
+        /// <param name="vFilePath">檔案路徑</param>
+        /// <param name="pDataType">Basic,mscore..</param>
+        /// <param name="pCalType">0:Value,1:Momentum</param>
+        /// <returns></returns>
+        private void TranFile(string vFilePath, string pDataType, int pCalType)
+        {
+            int vRecordIndex = 0;
+            int vRecordLength = 0;
+            decimal vTmpValue;
+            string vMessageStr = string.Format("請注意你目前要轉的{0}資料庫已經存在,點選OK將重新轉入", pDataType);
+            string vTmpStock;
+            string[] vStocks = null;
+            DateTime vTmpData_Date;
+            List<string[]> vDataList = FileKit.Read(FileKit.FileType.csv, vFilePath, "");
+            DataTable table = new DataTable();
+            table.Columns.Add("stock", typeof(string));
+            table.Columns.Add("data_date", typeof(DateTime));
+            table.Columns.Add("type", typeof(string));
+            table.Columns.Add("value", typeof(decimal));
+            DBHelper vDBHelper = new DBHelper(gMAXTRANCOUNT);
+            vDBHelper.SqlRowsCopied += VDBHelper_SqlRowsCopied;
+            if (vDBHelper.ChkData(pDataType, pCalType))
+            {
+                DialogResult vResult = MessageBox.Show(vMessageStr, "確認資料", MessageBoxButtons.OKCancel);
+                if (vResult == DialogResult.OK)
+                {
+                    if (vDBHelper.DelData(pDataType, pCalType))
+                    {
+                        this.BeginInvoke(new TextShowCallback(TextShow), logRichTextBox, string.Format("刪除{0}完成", pDataType));
+                    }
+                }
+                else
+                {
+                    this.BeginInvoke(new TextShowCallback(TextShow), logRichTextBox, "你已點選取消,將不轉入該檔,請選取其他資料轉入");
+                    this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+                    return;
+                }
+            }
+            foreach (string[] vRecords in vDataList)
+            {
+                vRecordIndex++;
+                vRecordLength = vRecords.Length;
+                if (vRecordIndex == 1)
+                {
+                    string[] vStockInfo;
+                    vStocks = new string[vRecordLength];
+                    //怕資料是 1101 台泥
+                    for (int vStockIndex = 0; vStockIndex < vRecordLength; vStockIndex++)
+                    {
+                        if (vRecords[vStockIndex].Trim().Contains(' '))
+                        {
+                            vStockInfo = vRecords[vStockIndex].Split(' ');
+                            if (vStockInfo != null && vStockInfo.Length > 0)
+                            {
+                                vStocks[vStockIndex] = vStockInfo[0].Trim();
+                            }
+                        }
+                        else
+                        {
+                            vStocks[vStockIndex] = vRecords[vStockIndex];
+                        }
+                    }
+
+                    gTotalCount = vDataList.Count * vRecordLength;
+                    if (vStocks == null)
+                    {
+                        MessageBox.Show("資料有誤請確認");
+                        this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+                        return;
+                    }
+                    this.BeginInvoke(new TextShowCallback(TextShow), logRichTextBox, string.Format("開始整理轉入資料..", pDataType));
+                }
+                else
+                {
+
+                    vTmpData_Date = ToolKit.ConvertStringToDateTime(vRecords[0]);
+                    for (int vIndex = 0; vIndex < vRecordLength; vIndex++)
+                    {
+                        vTmpStock = vStocks[vIndex];
+                        if (vIndex == 0 || string.IsNullOrEmpty(vTmpStock))
+                        {
+                            continue;
+                        }
+                        vTmpValue = ToolKit.GetDecimal(vRecords[vIndex]);
+                        //不用vRow["stock"]的原因是因為這樣比較快
+                        DataRow vRow = table.NewRow();
+                        vRow[0] = vTmpStock;
+                        vRow[1] = vTmpData_Date;
+                        vRow[2] = pDataType;
+                        vRow[3] = vTmpValue;
+                        table.Rows.Add(vRow);
+                        if ((table.Rows.Count / gMAXTRANCOUNT) >= 1)
+                        {
+                            vDBHelper.ReadFileToDB(table, pDataType, pCalType);
+                            table.Clear();
+                        }
+                    }
+                    //GC.Collect();
+                }
+            }
+            if (table.Rows.Count > 0)
+            {
+                vDBHelper.ReadFileToDB(table, pDataType, pCalType);
+                table.Clear();
+                GC.Collect();
+            }
+
+            this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+            this.BeginInvoke(new TextShowCallback(TextShow), logRichTextBox, string.Format("轉入{0}完成", pDataType));
+        }
+
+        /// 轉入BasicData市值
+        /// <summary>
+        /// 轉入BasicData市值
+        /// </summary>
+        /// <param name="vFilePath">檔案路徑</param>
+        /// <param name="pDataType">Basic,mscore..</param>
+        /// <param name="pCalType">0:Value,1:Momentum</param>
+        /// <returns></returns>
+        private void TranBasicFile(string vFilePath, string pDataType, int pCalType)
+        {
+            gDealCount = 0;
+            string[] vStocks = null;
+            List<string[]> vDataList = FileKit.Read(FileKit.FileType.csv, vFilePath, "");
+            int vRecordIndex = 0;
+            int vRecordLength = 0;
+            decimal vTmpMkt_Value;
+            string vTmpStock;
+            DateTime vTmpData_Date;
+            DataTable table = new DataTable();
+            table.Columns.Add("stock", typeof(string));
+            table.Columns.Add("data_date", typeof(DateTime));
+            table.Columns.Add("mkt_value", typeof(decimal));
+            DBHelper vDBHelper = new DBHelper(gMAXTRANCOUNT);
+            vDBHelper.SqlRowsCopied += VDBHelper_SqlRowsCopied;
+            if (vDBHelper.ChkData(pDataType, pCalType))
+            {
+                DialogResult vResult = MessageBox.Show(string.Format("請注意你目前要轉的{0} Data資料庫已經存在,點選OK將重新轉入", pDataType), "確認資料", MessageBoxButtons.OKCancel);
+                if (vResult == DialogResult.OK)
+                {
+                    if (vDBHelper.DelData(pDataType, pCalType))
+                    {
+                        this.BeginInvoke(new TextShowCallback(TextShow), logRichTextBox, string.Format("刪除{0}Data完成", pDataType));
+                    }
+                }
+                else
+                {
+                    this.BeginInvoke(new TextShowCallback(TextShow), logRichTextBox, "你已點選取消,將不轉入該檔,請選取其他資料轉入");
+                    return;
+                }
+            }
+
+            foreach (string[] vRecords in vDataList)
+            {
+                vRecordIndex++;
+                vRecordLength = vRecords.Length;
+                if (vRecordIndex == 1)
+                {
+                    vStocks = vRecords;
+                    gTotalCount = vDataList.Count * vRecordLength;
+                    if (vStocks == null)
+                    {
+                        MessageBox.Show("資料有誤請確認");
+                    }
+                }
+                //股票名稱
+                else if (vRecordIndex == 2)
+                {
+                    continue;
+                }
+                else
+                {
+                    vTmpData_Date = ToolKit.ConvertStringToDateTime(vRecords[0].Replace("總市值(億)", ""));
+                    for (int vIndex = 0; vIndex < vRecordLength; vIndex++)
+                    {
+                        vTmpStock = vStocks[vIndex].Trim();
+                        if (vIndex == 0 || string.IsNullOrEmpty(vTmpStock))
+                        {
+                            continue;
+                        }
+                        vTmpMkt_Value = ToolKit.GetDecimal(vRecords[vIndex]);
+                        DataRow vRow = table.NewRow();
+                        vRow[0] = vTmpStock;
+                        vRow[1] = vTmpData_Date;
+                        vRow[2] = vTmpMkt_Value;
+                        table.Rows.Add(vRow);
+
+                        if ((table.Rows.Count / gMAXTRANCOUNT) >= 1)
+                        {
+                            vDBHelper.ReadFileToDB(table, pDataType, pCalType);
+                            table.Clear();
+                        }
+                    }
+                    //GC.Collect();
+                }
+            }
+            if (table.Rows.Count > 0)
+            {
+                vDBHelper.ReadFileToDB(table, pDataType, pCalType);
+                table.Clear();
+                GC.Collect();
+            }
+            this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+            this.BeginInvoke(new TextShowCallback(TextShow), logRichTextBox, string.Format("轉入{0} Data完成", pDataType));
+        }
+
+        private void EnabledMethod(object sender)
+        {
+            bool IsTrueOrNot = (bool)sender;
+            this.btnGenAllFile.Enabled = IsTrueOrNot;
+            this.btnValueUpdData.Enabled = IsTrueOrNot;
+            this.btnMomentumUpdData.Enabled = IsTrueOrNot;
+        }
+
+        /// SQLBulkCopy的完成筆數
+        /// <summary>
+        /// SQLBulkCopy的完成筆數
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void VDBHelper_SqlRowsCopied(object sender, System.Data.SqlClient.SqlRowsCopiedEventArgs e)
+        {
+            decimal vRowCopied = e.RowsCopied;
+            gDealCount += vRowCopied;
+            decimal vDealProcess = ToolKit.GetDigitalValue((gDealCount / gTotalCount) * 100, 0);
+            TextShow(logRichTextBox, string.Format("處理進度..{0}%", vDealProcess));
+        }
+
+        /// 計算結果Button 事件
+        /// <summary>
+        /// 計算結果Button 事件
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void btnGenAllFile_Click(object sender, EventArgs e)
+        {
+            this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), false);
+            string vTakeNumber = this.txtTakeNumbers.Text; //取前幾大
+            string vStartMonth = cbBoxStartMonth.Text; //月份
+            //價值
+            string vFac1 = txtFac1.Text;  //因子
+            string vVol1 = txtVol1.Text;  //幅動率
+            string vCap1 = txtCap1.Text;  //CAP
+            //動能
+            string vFac2 = txtFac2.Text; //因子
+            string vVol2 = txtVol2.Text; //幅動率
+            string vCap2 = txtCap2.Text; //CAP
+            //成本
+            string vCost = txtCost.Text;
+            List<int> lstIAction = new List<int>();
+
+            #region Tab可以分開執行
+            //Tab可以分開執行
+            foreach (Control c in gpBox3.Controls)
+            {
+                if ((c is CheckBox) && ((CheckBox)c).Checked)
+                {
+                    //TextShow(logRichTextBox, c.Name);
+                    switch (c.Name)
+                    {
+                        case "chk11": //市值加權-價值
+                            lstIAction.Add(0);
+                            break;
+                        case "chk12": //市值加權-動能
+                            lstIAction.Add(1);
+                            break;
+                        case "chk21": //基本面加權-價值
+                            lstIAction.Add(2);
+                            if(string.IsNullOrEmpty(vFac1) || string.IsNullOrEmpty(vVol1) || string.IsNullOrEmpty(vCap1) || string.IsNullOrEmpty(vCost))
+                            {
+                                MessageBox.Show("基本面加權因子的價值條件設定有空值\n因子序號、幅動率、CAP值及交易成本不得為空值");
+                                this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+                                return;
+                            }
+                            break;
+                        case "chk22": //基本面加權-動能
+                            lstIAction.Add(3);
+                            if (string.IsNullOrEmpty(vFac2) || string.IsNullOrEmpty(vVol2) || string.IsNullOrEmpty(vCap2) || string.IsNullOrEmpty(vCost))
+                            {
+                                MessageBox.Show("基本面加權因子的動能條件設定有空值\n因子序號、幅動率、CAP值及交易成本不得為空值");
+                                this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+                                return;
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+            #endregion
+            if (lstIAction.Count <= 0)
+            {
+                MessageBox.Show("至少勾選一項要產出的項目");
+                this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+                return;
+            }
+
+            Thread vResultThread = new Thread(() => GenExcelResult(vTakeNumber, vStartMonth, vFac1, vVol1, vCap1, vFac2, vVol2, vCap2, vCost, lstIAction));
+            vResultThread.IsBackground = true;
+            vResultThread.Start();
+
+        }
+
+        /// 計算結果並產出Excel
+        /// <summary>
+        /// 計算結果並產出Excel
+        /// </summary>
+        /// <param name="pTakeNumber"></param>
+        /// <param name="pStartMonth"></param>
+        private void GenExcelResult(string pTakeNumber, string pStartMonth, string vFac1, string vVol1, string vCap1, string vFac2, string vVol2, string vCap2, string vCost, List<int> iAction)
+        {
+            if (pTakeNumber == "0" || string.IsNullOrEmpty(pTakeNumber))
+            {
+                MessageBox.Show("請輸入你欲挑選前幾大的資料");
+                this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+                return;
+            }
+            if (string.IsNullOrEmpty(pStartMonth))
+            {
+                MessageBox.Show("請輸入你欲挑選每年的幾月當成是rebalance");
+                this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+                return;
+            }
+            bool vISChkSuccess = false;
+            #region 確認價值因子設定 {0,2}
+            if (iAction.Exists(x => x % 2 == 0)) {
+                DataTable vValuePositiveFactor = GetValueFromCalDFV(0, ToolKit.CreateDataTableFormDataGridView(dgvValuePositiveFactor));
+                vISChkSuccess = ChkGUIParam(0, vValuePositiveFactor);
+            }
+            #endregion
+            #region 確認動能因子設定 {1,3}
+            if (iAction.Exists(x => x % 2 > 0))
+            {
+                DataTable vPositiveExcludeFactor = GetValueFromCalDFV(1, ToolKit.CreateDataTableFormDataGridView(dgvMomentumPositiveFator));
+                vISChkSuccess = ChkGUIParam(1, vPositiveExcludeFactor);
+            }
+
+            if (!vISChkSuccess)
+            {
+                this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+                return;
+            }
+            #endregion
+
+            TextShow(logRichTextBox, "檢查資料完成..開始計算資料");
+
+            int[] vTranJob = iAction.ToArray();
+            //new int[] { 0, 1 }; // 0:value,1:動能
+            //TextShow(logRichTextBox, string.Format("項目..{0},{1},{2},{3}", vTranJob[0], vTranJob[1], vTranJob[2], vTranJob[3]));
+            int iCount = iAction.Count;
+            //return;
+            if (iAction.Exists(x => x < 2)) { 
+                Parallel.For(0,
+                     iCount,
+                     index => //使用平行處理
+                     {
+                         DataSet vDS = DBHelper.GetCalResult(pTakeNumber, pStartMonth, vTranJob[index]);
+                         GenExcel(vDS, vTranJob[index]);
+                     });
+            }
+            if (iAction.Exists(x => x >= 2))
+            {
+                Parallel.For(0,
+                     iCount,
+                     index => //使用平行處理
+                     {
+                         int[] i =DBHelper.GetCalResult(pTakeNumber, pStartMonth,vFac1,vVol1,vCap1,vCost, vTranJob[index]);
+                         TextShow(logRichTextBox, string.Format("top={0},down={1}",i[0],i[1]));
+                     });
+
+            }
+
+                //todo開始產生資料
+                //DataSet vDS = DBHelper.GetCalResult(pTakeNumber, pStartMonth);
+
+                TextShow(logRichTextBox, "資料計算完成..開始產生Excel");
+            this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+        }
+
+        /// 產生Excel
+        /// <summary>
+        /// 產生Excel
+        /// </summary>
+        /// <param name="pDT"></param>
+        /// <param name="pJobIndex">1. 2. 3. 4.</param>
+        private void GenExcel(DataSet pDT, int pJobIndex)
+        {
+            string vEnglishStr = (pJobIndex == 0) ? "ValueResult" : "MomentumResult";
+            string vChineseStr = (pJobIndex == 0) ? "價值" : "動能";
+            string fileName = string.Format(@"{0}\{1}.xls", Application.StartupPath, vEnglishStr);
+
+            //設定輸入的報表表頭
+            //設定必要的物件
+            //按照順序
+            //分別是Application -> Workbook -> Worksheet -> Range -> Cell
+            Excel.Application xls = new Excel.Application();
+            Excel.Workbook workBook = null;
+            xls.Visible = false;
+            xls.UserControl = false;
+            workBook = xls.Workbooks.Add(System.Reflection.Missing.Value);
+            foreach (DataTable vTable in pDT.Tables)
+            {
+
+                Excel.Worksheet ws = (Excel.Worksheet)workBook.Sheets.Add(Type.Missing, Type.Missing, 1, Type.Missing);
+                ws = (Excel.Worksheet)workBook.ActiveSheet;
+                if (vTable.Rows.Count > 0)
+                {
+                    ws.Name = vTable.Rows[0]["TYPE"].ToString();
+                    TextShow(logRichTextBox, string.Format("開始產生{1}Sheet-{0}", ws.Name, vChineseStr));
+                    //在工作表的特定儲存格，設定內容
+                    //這裡是將表頭指定到儲存格A1和A2
+                    ws.Cells[1, 1] = "股票代碼";
+                    ws.Cells[2, 1] = "資料日期";
+                    ws.Cells[3, 1] = "資料類型";
+                    ws.Cells[4, 1] = "值";
+                    DataTable dt = vTable;
+                    //從第五行開始，設定第一欄和第二欄的內容
+                    //資料是從某資料表取出
+                    int row = 1;
+                    for (int counter = 0; counter < dt.Rows.Count; counter++)
+                    {
+                        ws.Cells[row, 1] = dt.Rows[counter]["STK_CD"].ToString();
+                        ws.Cells[row, 2] = dt.Rows[counter]["DATA_DATE"].ToString();
+                        ws.Cells[row, 3] = dt.Rows[counter]["TYPE"].ToString();
+                        ws.Cells[row, 4] = dt.Rows[counter]["VALUE"].ToString();
+                        row++;
+                    }
+                    ws.get_Range("A:D").EntireColumn.AutoFit();
+                }
+
+            }
+            try
+            {
+                TextShow(logRichTextBox, string.Format("{0} Excel產生完成..存檔中", vChineseStr));
+                //存檔
+                //在這裡只設定檔案名稱(含路徑)即可
+                workBook.SaveAs(fileName, Excel.XlFileFormat.xlWorkbookNormal, Type.Missing, Type.Missing, Type.Missing, Type.Missing,
+                    Excel.XlSaveAsAccessMode.xlShared, Type.Missing, Type.Missing, Type.Missing, Type.Missing, Type.Missing);
+
+                workBook.Close();
+                workBook = null;
+
+                xls.Quit();
+                xls = null;
+            }
+            catch (Exception ex)
+            {
+                TextShow(logRichTextBox, ex.Message);
+                TextShow(statusBar, "產生檔案發生問題,請與資訊部聯絡");
+                this.BeginInvoke(new EnabledObjectDelegate(EnabledMethod), true);
+            }
+        }
+
+        /// 確認價值和動能設定資料是否正確
+        /// <summary>
+        /// 確認價值和動能設定資料是否正確
+        /// </summary>
+        /// <param name="pCalType"></param>
+        /// <param name="pDT"></param>
+        private bool ChkGUIParam(int pCalType, DataTable pDT)
+        {
+            string vTmpFactorStr;
+            bool IsChkSuccess = false;
+            //塞入Value的排除參數
+            DBHelper.InsCalParam(pCalType, pDT);
+            //確認參數中設定的資料都已上傳
+            foreach (DataRow vRow in pDT.Rows)
+            {
+                if (pCalType == 0)
+                {
+                    vTmpFactorStr = vRow["VFactor"].ToString();
+                }
+                else
+                {
+                    vTmpFactorStr = vRow["MFactor"].ToString();
+                }
+                IsChkSuccess = DBHelper.ChkAllValueData(pCalType, vTmpFactorStr);
+                if (!IsChkSuccess)
+                {
+                    TextShow(logRichTextBox, string.Format("{0} {1}檢核有誤,請確認資料已經上傳", (pCalType == 0) ? "價值" : "動能", vTmpFactorStr));
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// 處理DataGridView的內容(中文轉正確的值)
+        /// <summary>
+        /// 處理DataGridView的內容(中文轉正確的值)
+        /// </summary>
+        /// <param name="pDT"></param>
+        /// <returns></returns>
+        private DataTable GetValueFromCalDFV(int pCalType, DataTable pDT)
+        {
+            string vWordingStr = (pCalType == 0) ? "價值" : "動能";
+            DataTable vDT = pDT.Clone();
+            string vTmpStr;
+            int vIndex = 1;
+            decimal vTmpValue = 0;
+            foreach (DataRow vRow in pDT.Rows)
+            {
+                DataRow vNewRow = vDT.NewRow();
+                //factor
+                if (string.IsNullOrEmpty(vRow[0].ToString().Trim()) && string.IsNullOrEmpty(vRow[1].ToString().Trim()))
+                {
+                    continue;
+                }
+                vTmpStr = vRow[0].ToString().Trim();
+                if (string.IsNullOrEmpty(vTmpStr))
+                {
+                    MessageBox.Show(string.Format("請確認{1}第{0}列的排除因子是空值無法繼續", vIndex, vWordingStr));
+                    throw new ArgumentNullException();
+                }
+                vNewRow[0] = vTmpStr;
+
+                //Operator
+                vTmpStr = vRow[1].ToString().Trim();
+                if (string.IsNullOrEmpty(vTmpStr))
+                {
+                    MessageBox.Show(string.Format("請確認{1}第{0}列的排除運算子是空值無法繼續", vIndex, vWordingStr));
+                    throw new ArgumentNullException();
+                }
+                if (vTmpStr == "大於")
+                {
+                    vNewRow[1] = ">";
+                }
+                else if (vTmpStr == "大於等於")
+                {
+                    vNewRow[1] = ">=";
+                }
+                else if (vTmpStr == "小於")
+                {
+                    vNewRow[1] = "<";
+                }
+                else if (vTmpStr == "小於等於")
+                {
+                    vNewRow[1] = "<=";
+                }
+                else if (vTmpStr == "百分比")
+                {
+                    vNewRow[1] = "%";
+                }
+                else
+                {
+                    vNewRow[1] = vTmpStr;
+                }
+
+                //Unit
+                vTmpStr = vRow[2].ToString().Trim();
+                if (string.IsNullOrEmpty(vTmpStr))
+                {
+                    MessageBox.Show(string.Format("請確認{1}第{0}列的排除運算子是空值無法繼續", vIndex, vWordingStr));
+                    throw new ArgumentNullException();
+                }
+                if (vTmpStr == "0" && decimal.TryParse(vTmpStr, out vTmpValue))
+                {
+                    MessageBox.Show(string.Format("請確認{1}第{0}列的排除單位是數字", vIndex, vWordingStr));
+                    throw new ArgumentNullException();
+                }
+                vNewRow[2] = vTmpStr;
+
+                //OrderBy
+                vTmpStr = vRow[3].ToString().Trim();
+                if (string.IsNullOrEmpty(vTmpStr))
+                {
+                    MessageBox.Show(string.Format("請確認{1}第{0}列的排序是空值無法繼續", vIndex, vWordingStr));
+                    throw new ArgumentNullException();
+                }
+                if (vTmpStr == "大到小")
+                {
+                    vNewRow[3] = "DESC";
+                }
+                else if (vTmpStr == "小到大")
+                {
+                    vNewRow[3] = "ASC";
+                }
+                else
+                {
+                    vNewRow[3] = vRow[3];
+                }
+
+                //PickUp
+                vTmpStr = vRow[4].ToString().Trim();
+                if (string.IsNullOrEmpty(vTmpStr))
+                {
+                    MessageBox.Show(string.Format("請確認{1}第{0}列的挑選是空值無法繼續", vIndex, vWordingStr));
+                    throw new ArgumentNullException();
+                }
+                if (vTmpStr == "後")
+                {
+                    vNewRow[4] = "FINAL";
+                }
+                else if (vTmpStr == "前")
+                {
+                    vNewRow[4] = "TOP";
+                }
+                else
+                {
+                    vNewRow[4] = vRow[4];
+                }
+                //Filter
+                vTmpStr = vRow[5].ToString().Trim();
+                if (string.IsNullOrEmpty(vTmpStr))
+                {
+                    MessageBox.Show(string.Format("請確認{1}第{0}列的篩選是空值無法繼續", vIndex, vWordingStr));
+                    throw new ArgumentNullException();
+                }
+                if (vTmpStr == "是")
+                {
+                    vNewRow[5] = "Y";
+                }
+                else if (vTmpStr == "否")
+                {
+                    vNewRow[5] = "N";
+                }
+                else
+                {
+                    vNewRow[5] = vRow[5];
+                }
+                vDT.Rows.Add(vNewRow);
+            }
+            return vDT;
+        }
+
+        /// 驗證使用者編輯的DataGridView資料 -- 價值
+        /// <summary>
+        /// 驗證使用者編輯的DataGridView資料 -- 價值
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void dgvValuePositiveFator_CellValidating(object sender, DataGridViewCellValidatingEventArgs e)
+        {
+            var currentcell = dgvValuePositiveFactor.CurrentCellAddress;
+            if (currentcell.X != -1)
+            {
+                string vInputValue = dgvValuePositiveFactor.Rows[currentcell.Y].Cells[currentcell.X].EditedFormattedValue.ToString();
+                if (currentcell.X == 3)
+                {
+                    if (vInputValue != null && vInputValue == "NONE")
+                    {
+                        dgvValuePositiveFactor.Rows[currentcell.Y].Cells["VPickUp"].ReadOnly = true;
+                    }
+                }
+                if (currentcell.X == 5 || currentcell.X == 1)
+                {
+                    vInputValue = dgvValuePositiveFactor.Rows[currentcell.Y].Cells[currentcell.X].EditedFormattedValue.ToString();
+                    if (vInputValue != null && vInputValue != "NONE" && vInputValue == "否")
+                    {
+                        vInputValue = dgvValuePositiveFactor.Rows[currentcell.Y].Cells[1].EditedFormattedValue.ToString();
+                        if (vInputValue != null && vInputValue != "NONE")
+                        {
+                            MessageBox.Show("通常最後的篩選值挑選運算子都是NONE");
+                        }
+                    }
+
+                }
+            }
+        }
+
+        /// 驗證使用者編輯的DataGridView資料 -- 動能
+        /// <summary>
+        /// 驗證使用者編輯的DataGridView資料 -- 動能
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void dgvMomentumPositiveFator_CellValidating(object sender, DataGridViewCellValidatingEventArgs e)
+        {
+            var currentcell = dgvMomentumPositiveFator.CurrentCellAddress;
+            if (currentcell.X != -1)
+            {
+                string vInputValue = dgvMomentumPositiveFator.Rows[currentcell.Y].Cells[currentcell.X].EditedFormattedValue.ToString();
+                if (currentcell.X == 3)
+                {
+                    if (vInputValue != null && vInputValue == "NONE")
+                    {
+                        dgvMomentumPositiveFator.Rows[currentcell.Y].Cells["MPickUp"].ReadOnly = true;
+                    }
+                }
+            }
+        }
+
+        /// 資料顯示在RichEditBox或是Statusbar,要避掉cross thread的問題
+        /// <summary>
+        /// 資料顯示在RichEditBox或是Statusbar,要避掉cross thread的問題
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="statusText"></param>
+        private void TextShow(object sender, string statusText)
+        {
+            if (sender is StatusBar)
+            {
+                if ((sender as StatusBar).InvokeRequired)
+                {
+                    TextShowCallback tsb = new TextShowCallback(TextShow);
+                    this.Invoke(tsb, new object[] { sender, statusText });
+                }
+                else
+                    (sender as StatusBar).Text = statusText;
+            }
+            else if (sender is RichTextBox)
+            {
+                if ((sender as RichTextBox).InvokeRequired)
+                {
+                    TextShowCallback tsb = new TextShowCallback(TextShow);
+                    this.Invoke(tsb, new object[] { sender, statusText });
+                }
+                else
+                {
+                    if ((sender as RichTextBox).Lines.Length > gMAXLEN)
+                        (sender as RichTextBox).Text = string.Empty;
+                    (sender as RichTextBox).AppendText(string.Format("{0}:{1}\n", DateTime.Now.ToString("HH:mm:ss"), statusText));
+                }
+            }
+        }
+
+        private void SmartBetaForm_Load(object sender, EventArgs e)
+        {
+
+        }
+
+        /// <summary>
+        /// 市值加權全選
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void chk10_CheckedChanged(object sender, EventArgs e)
+        {
+            if (chk10.CheckState.Equals(CheckState.Checked))
+            {
+                chk11.Checked = true;
+                chk12.Checked = true;
+            }
+            else
+            {
+                chk11.Checked = false;
+                chk12.Checked = false;
+            }
+        }
+        /// <summary>
+        /// 基本面加權的全選
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void chk20_CheckedChanged(object sender, EventArgs e)
+        {
+            if (chk20.CheckState.Equals(CheckState.Checked))
+            {
+                chk21.Checked = true;
+                chk22.Checked = true;
+            }
+            else
+            {
+                chk21.Checked = false;
+                chk22.Checked = false;
+            }
+        }
+    }
+}
